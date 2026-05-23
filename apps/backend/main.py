@@ -1,24 +1,24 @@
 import os
 import tempfile
 from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Optional
 
+from sqlalchemy.orm import session
+import uvicorn
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import OpenAI
-from pydantic import BaseModel
 from pypdf import PdfReader
 from sqlmodel import Session, select
 
 from database import create_db_and_tables, get_session
-from schema import DocumentChunk
-from utils import client, get_openai,embed_text
-from schema import ChatRequest,ChatResponse
+from schema import ChatRequest, DocumentChunk
+from utils import client, embed_text
 
+load_dotenv()
 
-
-EMBEDDING_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
-EMBEDDING_DIM = 1536
 TOP_K = 5
 
 
@@ -30,10 +30,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-_client: OpenAI | None = None
-
-
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/upload")
@@ -41,6 +43,7 @@ async def upload(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ):
+    print("hi there")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(await file.read())
         temp_path = temp_file.name
@@ -52,17 +55,20 @@ async def upload(
         if text:
             full_text += text + "\n"
 
+    os.unlink(temp_path)
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
     )
     chunks = splitter.split_text(full_text)
-
-    document_id = hash(file.filename or temp_path) % (2**31 - 1)
+    print("hi there 2",chunks)
+    document_id = abs(hash(file.filename or temp_path)) % (2**31 - 1)
     stored = 0
 
     for index, chunk in enumerate(chunks):
         vector = embed_text(chunk)
+        print("vector",vector,"chunk",chunk)
         session.add(
             DocumentChunk(
                 document_id=document_id,
@@ -76,52 +82,60 @@ async def upload(
     session.commit()
 
     return {
-        "document_id": document_id,
+        "session_id": str(document_id),
         "filename": file.filename,
         "chunks_stored": stored,
     }
 
+SYSTEM_PROMPT="""
+    You are a document assistant
+        Answer ONLY using the provided context chunks.
+        If the answer is not in the chunks, say exactly:
+        I cannot find this in the document.
+        Never use outside knowledge. Never infer beyond what is written
+"""
 
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(body: ChatRequest, session: Session = Depends(get_session)):
-    query_vector = embed_text(body.question)
+@app.post("/chat")
+async def chat(body: ChatRequest, db_session: Session = Depends(get_session)):
 
-    statement = (
+    query_vector = embed_text(body.message)
+
+    stmt = (
         select(DocumentChunk)
         .order_by(DocumentChunk.embedding.cosine_distance(query_vector))
         .limit(TOP_K)
     )
-    if body.document_id is not None:
-        statement = statement.where(DocumentChunk.document_id == body.document_id)
+    chunks = db_session.exec(stmt).all()
+    context = "\n\n".join(chunk.content for chunk in chunks)
 
-    chunks = session.exec(statement).all()
-    if not chunks:
-        return ChatResponse(
-            answer="No documents found. Upload a PDF first.",
-            sources=[],
-        )
+    response = client.chat.completions.create(
+        model="meta/llama-3.1-70b-instruct",
 
-    context = "\n\n---\n\n".join(chunk.content for chunk in chunks)
-    completion = get_openai().chat.completions.create(
-        model=CHAT_MODEL,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Answer using only the context below. "
-                    "If the answer is not in the context, say you don't know."
+                    SYSTEM_PROMPT
                 ),
             },
             {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {body.question}",
-            },
+                "role":"user",
+                "content":f"Context:${context}/n Question:{body.message}"
+            }
+
         ],
+        temperature=0.3,
+        top_p=0.7,
+        max_tokens=128,
     )
 
-    return ChatResponse(
-        answer=completion.choices[0].message.content or "",
-        sources=[chunk.content[:200] for chunk in chunks],
-    )
+    return {
+        "answer": response.choices[0].message.content,
+        "session_id": body.session_id,
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=9000)
