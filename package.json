@@ -2,13 +2,15 @@
   "name": "chatbot",
   "private": true,
   "scripts": {
-    "build": "turbo run build",
-    "dev": "turbo run dev",
+    "dev:web": "cd apps/web && bun run dev",
+    "dev:backend": "cd apps/backend && uv run uvicorn main:app --reload",
+    "dev": "concurrently \"bun run dev:web\" \"bun run dev:backend\"",
     "lint": "turbo run lint",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
     "check-types": "turbo run check-types"
   },
   "devDependencies": {
+    "concurrently": "^10.0.0",
     "prettier": "^3.7.4",
     "turbo": "^2.9.14",
     "typescript": "5.9.2"
